@@ -139,6 +139,21 @@ sessions for you.
 This repo includes a benchmark runner that drives the Tolstoy agent and grades
 its returned answer with the `longcot` package.
 
+Good smoke-test pattern for a genuinely small sample:
+
+```bash
+python apps/benchmarking/run_longcot.py \
+  --session-type direct \
+  --domain chess \
+  --shortest-first \
+  --n 1 \
+  --workers 1 \
+  --max-iter 8 \
+  --k-answer 1 \
+  --k-validator 1 \
+  --timeout-ms 120000
+```
+
 HTTP mode example:
 
 ```bash
@@ -163,6 +178,42 @@ python apps/benchmarking/run_longcot.py \
   --max-iter 24 \
   --k-answer 3
 ```
+
+Higher-`k` example:
+
+```bash
+python apps/benchmarking/run_longcot.py \
+  --session-type direct \
+  --domain chess \
+  --shortest-first \
+  --n 1 \
+  --workers 1 \
+  --max-iter 8 \
+  --k-answer 5 \
+  --k-validator 1 \
+  --timeout-ms 120000 \
+  --tag smoke_shortest_k5
+```
+
+Useful benchmark flags:
+
+- `--shortest-first`: sort the filtered question set by prompt length before
+  applying `--n` or `--index`; this is the easiest way to get a true smoke
+  test instead of accidentally picking a very large prompt.
+- `--heartbeat-s`: print per-question progress while a sample is still running.
+- `--verbose`: enable Tolstoy debug logs during the benchmark run.
+- `--timeout-ms`: per-question timeout budget.
+- `--k-answer`, `--k-validator`, `--k-gc`: fan-out controls for the Tolstoy
+  agent.
+
+Notes:
+
+- In direct mode, the benchmark runner does a direct-session initialization
+  check before launching the worker pool, so schema/setup issues fail early.
+- Each benchmark entry now records `error`, `elapsed_seconds`, and
+  `prompt_chars` in addition to the prediction and Tolstoy trace metadata.
+- Larger `k_answer` values work, but they often need more time. Increase
+  `--timeout-ms` accordingly.
 
 Results are written under `results/longcot/`, including:
 

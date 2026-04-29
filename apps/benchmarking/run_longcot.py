@@ -1,20 +1,25 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import concurrent.futures
 import json
 import os
 import sys
 import threading
+import time
+from contextlib import suppress
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from longcot import load_questions, verify
 from longcot._types import ChemistryVerifyOptions, MathVerifyOptions, VerifyOptions
+from leaf_common.time.timeout_reached_exception import TimeoutReachedException
 
 from neuro_san.client.agent_session_factory import AgentSessionFactory
 from neuro_san.client.streaming_input_processor import StreamingInputProcessor
+from neuro_san.internals.chat.data_driven_chat_session import DataDrivenChatSession
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
@@ -77,6 +82,57 @@ def create_session(session_type: str, agent_name: str, host: str, port: int, tim
     )
 
 
+def _log_line(message: str) -> None:
+    with _LOCK:
+        print(message, flush=True)
+
+
+def _assert_direct_session_initializable_sync(session) -> None:
+    async def _run() -> None:
+        invocation_context = session.invocation_context.safe_shallow_copy()
+        chat_session = DataDrivenChatSession(agent_network=session.agent_network)
+        try:
+            await chat_session.set_up(invocation_context, {})
+        finally:
+            with suppress(Exception):
+                await chat_session.delete_resources()
+            with suppress(Exception):
+                invocation_context.close()
+
+    asyncio.run(_run())
+
+
+def run_request(session, thread: dict[str, Any], request: str, thinking_file: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    processor = StreamingInputProcessor("DEFAULT", thinking_file, session, None)
+    next_thread = dict(thread)
+    next_thread["user_input"] = request
+    next_thread = processor.process_once(next_thread)
+    sly_data = next_thread.get("sly_data") or {}
+    return next_thread, sly_data
+
+
+def run_request_with_progress(
+    session,
+    thread: dict[str, Any],
+    request: str,
+    heartbeat_s: float,
+    question_id: str,
+    thinking_file: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    if heartbeat_s <= 0:
+        return run_request(session, thread, request, thinking_file)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(run_request, session, thread, request, thinking_file)
+        start = time.time()
+        while True:
+            try:
+                return future.result(timeout=heartbeat_s)
+            except concurrent.futures.TimeoutError:
+                elapsed = time.time() - start
+                _log_line(f"  [{question_id}] still working: {elapsed:.1f}s")
+
+
 def build_request(question_text: str, args, frames_path: str, result_path: str) -> str:
     payload = {
         "problem": question_text,
@@ -106,13 +162,29 @@ def verify_answer(question, answer: str) -> bool:
         return False
 
 
-def print_progress(question_id: str, is_correct: bool, iterations: int | None) -> None:
+def format_exception(exc: Exception, timeout_ms: float) -> str:
+    if isinstance(exc, TimeoutReachedException):
+        return (
+            f"{exc.__class__.__name__}: question exceeded the configured timeout of "
+            f"{timeout_ms / 1000.0:.1f}s"
+        )
+    message = str(exc).strip()
+    if message:
+        return f"{exc.__class__.__name__}: {message}"
+    return exc.__class__.__name__
+
+
+def print_progress(question_id: str, is_correct: bool, iterations: int | None, error: str | None = None) -> None:
     global _COMPLETED
     with _LOCK:
         _COMPLETED += 1
-        status = "CORRECT  " if is_correct else "INCORRECT"
+        if error:
+            status = "ERROR    "
+        else:
+            status = "CORRECT  " if is_correct else "INCORRECT"
         iter_text = f"  iters={iterations:3d}" if iterations is not None else ""
-        print(f"  [{_COMPLETED:3d}/{_TOTAL}]  {status}{iter_text}  {question_id}")
+        detail = f"  {error}" if error else ""
+        print(f"  [{_COMPLETED:3d}/{_TOTAL}]  {status}{iter_text}  {question_id}{detail}")
 
 
 def run_one(question, args, run_id: str) -> dict[str, Any]:
@@ -121,23 +193,39 @@ def run_one(question, args, run_id: str) -> dict[str, Any]:
     suffix += f"_{run_id}" if run_id else ""
     frames_path = str(FRAMES_DIR / f"{qid}_frames{suffix}.json")
     result_path = str(RESULTS_DIR / f"{qid}_result{suffix}.json")
+    thinking_file = f"/tmp/neuro_san_tolstoy_longcot_{qid}{suffix}.txt"
 
     session = create_session(args.session_type, args.agent_name, args.host, args.port, args.timeout_ms)
     thread = make_thread(args.timeout_ms)
     request = build_request(question.prompt, args, frames_path, result_path)
+    start = time.time()
+
+    response = ""
+    sly_data: dict[str, Any] = {}
+    result: dict[str, Any] = {}
+    error: str | None = None
 
     try:
-        processor = StreamingInputProcessor("DEFAULT", f"/tmp/neuro_san_tolstoy_longcot_{qid}.txt", session, None)
-        thread["user_input"] = request
-        thread = processor.process_once(thread)
+        thread, sly_data = run_request_with_progress(
+            session,
+            thread,
+            request,
+            args.heartbeat_s,
+            qid,
+            thinking_file,
+        )
         response = (thread.get("last_chat_response") or "").strip()
-        sly_data = thread.get("sly_data") or {}
+        result = sly_data.get("tolstoy_result") or {}
+        if not response:
+            error = "empty response from agent network"
+    except Exception as exc:
+        error = format_exception(exc, args.timeout_ms)
     finally:
         session.close()
 
-    result = sly_data.get("tolstoy_result") or {}
-    is_correct = verify_answer(question, response)
-    print_progress(qid, is_correct, result.get("iterations"))
+    elapsed = time.time() - start
+    is_correct = verify_answer(question, response) if not error else False
+    print_progress(qid, is_correct, result.get("iterations"), error)
 
     return {
         "question_id": question.question_id,
@@ -147,6 +235,9 @@ def run_one(question, args, run_id: str) -> dict[str, Any]:
         "gold_answer": question.answer,
         "predicted_answer": response,
         "correct": is_correct,
+        "error": error,
+        "elapsed_seconds": elapsed,
+        "prompt_chars": len(question.prompt or ""),
         "iterations": result.get("iterations"),
         "nodes": result.get("nodes"),
         "final_node_id": result.get("final_node_id"),
@@ -163,6 +254,7 @@ def main():
     parser.add_argument("--index", type=int, help="Run one question by 0-based index in the filtered set.")
     parser.add_argument("--question-id", help="Run one question by LongCoT question id.")
     parser.add_argument("--workers", type=int, default=1, help="Number of concurrent question workers.")
+    parser.add_argument("--shortest-first", action="store_true", help="Sort the filtered question set by prompt length before slicing.")
     parser.add_argument("--overwrite", action="store_true", help="Overwrite an existing JSONL log.")
     parser.add_argument("--tag", default="", help="Optional tag appended to result files.")
 
@@ -176,6 +268,8 @@ def main():
     parser.add_argument("--host", default=os.environ.get("NS_HOST", "localhost"))
     parser.add_argument("--port", type=int, default=int(os.environ.get("NS_PORT", "30011")))
     parser.add_argument("--timeout-ms", type=float, default=180000.0)
+    parser.add_argument("--heartbeat-s", type=float, default=15.0, help="Per-question progress heartbeat in seconds; set <= 0 to disable.")
+    parser.add_argument("--verbose", action="store_true", help="Enable Tolstoy debug logging for direct runs.")
 
     parser.add_argument("--max-iter", type=int, default=24)
     parser.add_argument("--max-active-nodes", type=int, default=10)
@@ -192,6 +286,8 @@ def main():
 
     args = parser.parse_args()
     args.agent_name = normalize_agent_name(args.session_type, args.agent_name)
+    if args.verbose:
+        os.environ["NS_TOLSTOY_DEBUG"] = "1"
 
     questions = load_questions()
     if args.domain:
@@ -200,10 +296,19 @@ def main():
         questions = [question for question in questions if str(question.difficulty) == str(args.difficulty)]
     if args.question_id:
         questions = [question for question in questions if str(question.question_id) == str(args.question_id)]
+    if args.shortest_first:
+        questions = sorted(questions, key=lambda question: len(question.prompt or ""))
     if args.index is not None:
         questions = [questions[args.index]]
     if args.n is not None:
         questions = questions[: args.n]
+
+    if args.session_type == "direct":
+        initial_session = create_session(args.session_type, args.agent_name, args.host, args.port, args.timeout_ms)
+        try:
+            _assert_direct_session_initializable_sync(initial_session)
+        finally:
+            initial_session.close()
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     log_path = RESULTS_DIR / f"longcot_tolstoy_{timestamp}.jsonl"
@@ -229,7 +334,7 @@ def main():
                         handle.write(json.dumps(entry, ensure_ascii=False) + "\n")
                         handle.flush()
                 except Exception as exc:  # pragma: no cover - integration runner
-                    print(f"  ERROR on {question.question_id}: {exc}")
+                    print(f"  ERROR on {question.question_id}: {format_exception(exc, args.timeout_ms)}")
 
     correct = sum(1 for entry in entries if entry["correct"])
     total = len(entries)
