@@ -139,6 +139,11 @@ sessions for you.
 This repo includes a benchmark runner that drives the Tolstoy agent and grades
 its returned answer with the `longcot` package.
 
+By default, the runner uses LongCoT's normal verifier settings. That makes the
+default path the right one for leaderboard-style evaluation. The optional
+`--disable-verifier-fallback` flag is only for ablations; it turns off the
+math/chem fallback judges and will generally make those domains score worse.
+
 Good smoke-test pattern for a genuinely small sample:
 
 ```bash
@@ -203,6 +208,9 @@ Useful benchmark flags:
 - `--heartbeat-s`: print per-question progress while a sample is still running.
 - `--verbose`: enable Tolstoy debug logs during the benchmark run.
 - `--timeout-ms`: per-question timeout budget.
+- `--disable-verifier-fallback`: disable LongCoT's default fallback verification
+  for math and chemistry; keep this off unless you are doing a controlled
+  ablation.
 - `--k-answer`, `--k-validator`, `--k-gc`: fan-out controls for the Tolstoy
   agent.
 
@@ -210,8 +218,12 @@ Notes:
 
 - In direct mode, the benchmark runner does a direct-session initialization
   check before launching the worker pool, so schema/setup issues fail early.
-- Each benchmark entry now records `error`, `elapsed_seconds`, and
-  `prompt_chars` in addition to the prediction and Tolstoy trace metadata.
+- Each benchmark entry now records `raw_prediction`, normalized
+  `predicted_answer`, `error`, `elapsed_seconds`, and `prompt_chars` in
+  addition to the Tolstoy trace metadata.
+- If the DAG reaches its iteration limit without an explicit final-answer node,
+  the engine now makes one last synthesis pass over the active answered facts
+  before falling back to the latest answered node.
 - Larger `k_answer` values work, but they often need more time. Increase
   `--timeout-ms` accordingly.
 
@@ -220,6 +232,40 @@ Results are written under `results/longcot/`, including:
 - per-question JSONL benchmark logs
 - per-question DAG frame captures
 - per-question structured result payloads
+
+## Recommended benchmark workflow
+
+If your goal is a public LongCoT submission, a good sequence is:
+
+1. Start with `easy` only (the `LongCoT-Mini` style pass), not the full set.
+2. Compare one or two candidate `k_answer` values on a short slice, usually
+   something like `k_answer=3` versus `k_answer=5`.
+3. Keep `k_validator` small during tuning; `1` is a good cheap baseline.
+4. Once one configuration is clearly better, run the full `easy` split.
+5. Only then spend the money on the full `medium` + `hard` evaluation.
+
+Example pilot:
+
+```bash
+python apps/benchmarking/run_longcot.py \
+  --session-type direct \
+  --domain chess \
+  --shortest-first \
+  --n 10 \
+  --workers 1 \
+  --max-iter 8 \
+  --k-answer 3 \
+  --k-validator 1 \
+  --timeout-ms 180000 \
+  --tag pilot_chess_k3
+```
+
+Then rerun the same slice with `--k-answer 5` and compare:
+
+- accuracy
+- per-question error rate
+- elapsed time
+- token/cost usage from your model provider
 
 ## Verification
 

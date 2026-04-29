@@ -5,6 +5,7 @@ import asyncio
 import concurrent.futures
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -14,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 from longcot import load_questions, verify
+from longcot._parsing import extract_last_balanced_brackets, extract_solution
 from longcot._types import ChemistryVerifyOptions, MathVerifyOptions, VerifyOptions
 from leaf_common.time.timeout_reached_exception import TimeoutReachedException
 
@@ -34,6 +36,7 @@ FRAMES_DIR.mkdir(parents=True, exist_ok=True)
 
 DEFAULT_AGENT = "tolstoy/tolstoy_reasoner"
 DEFAULT_SESSION_TYPE = os.environ.get("NS_SESSION_TYPE", "http")
+SOLUTION_FORMAT_RE = re.compile(r"format\s*:\s*solution\s*=\s*(.+)", re.IGNORECASE)
 
 NO_FALLBACK = VerifyOptions(
     math=MathVerifyOptions(enable_fallback=False),
@@ -154,10 +157,66 @@ def build_request(question_text: str, args, frames_path: str, result_path: str) 
     return json.dumps(payload, ensure_ascii=False, indent=2)
 
 
-def verify_answer(question, answer: str) -> bool:
-    wrapped = f"solution = [{answer}]"
+def _infer_expected_solution_shape(prompt: str) -> str:
+    match = SOLUTION_FORMAT_RE.search(prompt or "")
+    if not match:
+        return "unknown"
+    template = match.group(1).strip()
+    if template.startswith("["):
+        return "list"
+    return "scalar"
+
+
+def format_benchmark_response(question, response: str) -> str:
+    raw = (response or "").strip()
+    if not raw:
+        return ""
+
+    body = (extract_solution(raw) or raw).strip()
+    shape = _infer_expected_solution_shape(question.prompt or "")
+
+    if shape == "list":
+        bracketed = extract_last_balanced_brackets(body)
+        if bracketed:
+            body = bracketed
+        elif not body.startswith("["):
+            body = f"[{body}]"
+    elif shape == "scalar":
+        body = next((line.strip() for line in body.splitlines() if line.strip()), body)
+
+    return f"solution = {body}"
+
+
+def _verification_options(disable_fallback: bool) -> VerifyOptions | None:
+    if not disable_fallback:
+        return None
+    return NO_FALLBACK
+
+
+def _looks_like_transport_repr(text: str) -> bool:
+    stripped = (text or "").strip()
+    if not stripped:
+        return False
+    return "tool_result_origin=" in stripped or stripped.startswith("content='' additional_kwargs={}")
+
+
+def extract_response_text(thread: dict[str, Any], sly_data: dict[str, Any]) -> str:
+    result = sly_data.get("tolstoy_result") or {}
+    canonical = str(result.get("answer") or "").strip()
+    if canonical:
+        return canonical
+
+    transcript = str(thread.get("last_chat_response") or "").strip()
+    if _looks_like_transport_repr(transcript):
+        return ""
+    return transcript
+
+
+def verify_answer(question, answer: str, disable_fallback: bool) -> bool:
+    if not answer:
+        return False
     try:
-        return verify(question, wrapped, options=NO_FALLBACK)
+        return verify(question, answer, options=_verification_options(disable_fallback))
     except Exception:
         return False
 
@@ -201,6 +260,7 @@ def run_one(question, args, run_id: str) -> dict[str, Any]:
     start = time.time()
 
     response = ""
+    formatted_response = ""
     sly_data: dict[str, Any] = {}
     result: dict[str, Any] = {}
     error: str | None = None
@@ -214,7 +274,8 @@ def run_one(question, args, run_id: str) -> dict[str, Any]:
             qid,
             thinking_file,
         )
-        response = (thread.get("last_chat_response") or "").strip()
+        response = extract_response_text(thread, sly_data)
+        formatted_response = format_benchmark_response(question, response)
         result = sly_data.get("tolstoy_result") or {}
         if not response:
             error = "empty response from agent network"
@@ -224,7 +285,7 @@ def run_one(question, args, run_id: str) -> dict[str, Any]:
         session.close()
 
     elapsed = time.time() - start
-    is_correct = verify_answer(question, response) if not error else False
+    is_correct = verify_answer(question, formatted_response, args.disable_verifier_fallback) if not error else False
     print_progress(qid, is_correct, result.get("iterations"), error)
 
     return {
@@ -233,7 +294,8 @@ def run_one(question, args, run_id: str) -> dict[str, Any]:
         "difficulty": question.difficulty,
         "template": (question.problem or {}).get("template"),
         "gold_answer": question.answer,
-        "predicted_answer": response,
+        "raw_prediction": response,
+        "predicted_answer": formatted_response,
         "correct": is_correct,
         "error": error,
         "elapsed_seconds": elapsed,
@@ -270,6 +332,11 @@ def main():
     parser.add_argument("--timeout-ms", type=float, default=180000.0)
     parser.add_argument("--heartbeat-s", type=float, default=15.0, help="Per-question progress heartbeat in seconds; set <= 0 to disable.")
     parser.add_argument("--verbose", action="store_true", help="Enable Tolstoy debug logging for direct runs.")
+    parser.add_argument(
+        "--disable-verifier-fallback",
+        action="store_true",
+        help="Disable LongCoT's default math/chem fallback verification. Leave this off for leaderboard-comparable runs.",
+    )
 
     parser.add_argument("--max-iter", type=int, default=24)
     parser.add_argument("--max-active-nodes", type=int, default=10)

@@ -61,3 +61,47 @@ REASON: Ask for the single arithmetic result.""",
     assert result["final_node_id"] == 1
     assert result["nodes"] == 2
     assert any(frame.get("final_node_id") == 1 for frame in result["frames"])
+
+
+def test_engine_synthesizes_final_answer_after_iteration_limit():
+    callers = {
+        "proposer": SequenceCaller(
+            "proposer",
+            [
+                """PARENT FACTS: 0
+PROPOSED QUESTION: From the original problem statement "What is 2 + 2? Return your answer in the format: solution = <integer>.", compute the arithmetic sum and return it as `SUM = <integer>`.
+RETIRE: NONE
+REASON: First derive the arithmetic result as an intermediate fact.""",
+            ],
+        ),
+        "validator": SequenceCaller(
+            "validator",
+            [
+                "ITEM 1: PASS - self-contained\nITEM 2: PASS - cited\nITEM 3: PASS - unambiguous\nVERDICT: ACCEPT",
+            ],
+        ),
+        "answerer": SequenceCaller(
+            "answerer",
+            [
+                "FINAL ANSWER: SUM = 4",
+                "FINAL ANSWER: solution = 4",
+            ],
+        ),
+    }
+
+    engine = TolstoyEngine(
+        callers=callers,
+        config=TolstoyRunConfig(
+            max_iter=1,
+            k_answer=1,
+            k_validator=1,
+            cite_problem=True,
+        ),
+    )
+
+    result = asyncio.run(engine.run("What is 2 + 2? Return your answer in the format: solution = <integer>."))
+
+    assert result["answer"] == "solution = 4"
+    assert result["final_node_id"] == 2
+    assert result["nodes"] == 3
+    assert any(frame.get("final_node_id") == 2 for frame in result["frames"])

@@ -145,6 +145,12 @@ class TolstoyEngine:
             await self._maybe_update_scratchpad(state, new_node)
             state.snapshot(f"node {new_node.id} added [{new_node.status.value}]")
 
+        synthesized = await self._synthesize_final_answer(state)
+        if synthesized is not None:
+            _debug(f"synthesized final answer via node {synthesized.id}")
+            state.snapshot(f"done via synthesized node {synthesized.id}", final_node_id=synthesized.id)
+            return self._finalize(state, synthesized.answer, self.config.max_iter, synthesized.id)
+
         best = self._latest_answered(state)
         final_answer = best.answer if best else ""
         final_node_id = best.id if best else None
@@ -373,12 +379,48 @@ class TolstoyEngine:
             return True, (canonical or answers[0].strip())
         return False, None
 
+    async def _synthesize_final_answer(self, state: DagState) -> Node | None:
+        if "answerer" not in self.callers:
+            return None
+
+        parent_ids = [node.id for node in state.active_answered(include_fact0=False)]
+        if not parent_ids:
+            return None
+
+        question = self._build_final_synthesis_question(state, parent_ids)
+        status, answer_text, raw_answers = await self._answer(state, question, parent_ids)
+        if status != NodeStatus.ANSWERED:
+            _debug(f"final synthesis failed status={status.value}")
+            return None
+
+        node = Node(
+            id=len(state.nodes),
+            question=question,
+            answer=answer_text,
+            parent_ids=parent_ids,
+            status=NodeStatus.ANSWERED,
+            raw_answers=raw_answers,
+        )
+        state.add_node(node)
+        return node
+
     async def _call_many(self, caller: AgentCaller, count: int, tool_args: dict) -> list[str]:
         _debug(f"dispatch {max(count, 1)} call(s) to {caller.get_name()}")
         coroutines = [caller.call_agent(tool_args) for _ in range(max(count, 1))]
         results = list(await asyncio.gather(*coroutines))
         _debug(f"completed {len(results)} call(s) to {caller.get_name()}")
         return results
+
+    def _build_final_synthesis_question(self, state: DagState, parent_ids: list[int]) -> str:
+        facts = self._format_source_nodes(state, parent_ids)
+        return (
+            "Use only the original problem statement and the cited facts below.\n\n"
+            f"Original problem:\n{state.problem}\n\n"
+            "Cited facts:\n"
+            f"{facts}\n\n"
+            "Solve the original problem. Return the answer in exactly the format requested "
+            "inside the original problem statement."
+        )
 
     def _format_node(self, node: Node) -> str:
         status = "" if node.status == NodeStatus.ANSWERED else f" [{node.status.value}]"

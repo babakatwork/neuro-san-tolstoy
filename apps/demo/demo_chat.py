@@ -128,6 +128,26 @@ def run_turn(session, thread, user_input: str):
     return processor.process_once(thread)
 
 
+def _looks_like_transport_repr(text: str) -> bool:
+    stripped = (text or "").strip()
+    if not stripped:
+        return False
+    return "tool_result_origin=" in stripped or stripped.startswith("content='' additional_kwargs={}")
+
+
+def extract_response_text(thread) -> str:
+    sly_data = thread.get("sly_data") or {}
+    result = sly_data.get("tolstoy_result") or {}
+    canonical = str(result.get("answer") or "").strip()
+    if canonical:
+        return canonical
+
+    transcript = str(thread.get("last_chat_response") or "").strip()
+    if _looks_like_transport_repr(transcript):
+        return ""
+    return transcript
+
+
 async def assert_direct_session_initializable(session) -> None:
     invocation_context = session.invocation_context.safe_shallow_copy()
     chat_session = DataDrivenChatSession(agent_network=session.agent_network)
@@ -212,7 +232,7 @@ async def main():
                 session.close()
             elapsed = time.time() - start
             print(f"[completed in {elapsed:.2f}s]")
-            print(thread.get("last_chat_response") or "")
+            print(extract_response_text(thread))
         except Exception as exc:  # pragma: no cover - interactive convenience
             print(f"ERROR: {format_exception(exc, args.timeout_ms)}")
 
