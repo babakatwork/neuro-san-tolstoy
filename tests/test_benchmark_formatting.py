@@ -1,6 +1,10 @@
 from types import SimpleNamespace
 
-from apps.benchmarking.run_longcot import extract_response_text, format_benchmark_response
+from apps.benchmarking.run_longcot import (
+    extract_response_text,
+    filter_questions_by_difficulty,
+    format_benchmark_response,
+)
 
 
 def _question(prompt: str):
@@ -41,3 +45,14 @@ def test_extract_response_text_prefers_structured_answer_and_drops_transport_rep
 
     thread["sly_data"]["tolstoy_result"]["answer"] = "solution = 4"
     assert extract_response_text(thread, thread["sly_data"]) == "solution = 4"
+
+
+def test_filter_questions_by_difficulty_supports_longcot_aliases():
+    questions = [
+        SimpleNamespace(difficulty="easy"),
+        SimpleNamespace(difficulty="medium"),
+        SimpleNamespace(difficulty="hard"),
+    ]
+
+    assert len(filter_questions_by_difficulty(questions, "longcot-mini")) == 1
+    assert len(filter_questions_by_difficulty(questions, "longcot")) == 2

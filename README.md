@@ -205,6 +205,9 @@ Useful benchmark flags:
 - `--shortest-first`: sort the filtered question set by prompt length before
   applying `--n` or `--index`; this is the easiest way to get a true smoke
   test instead of accidentally picking a very large prompt.
+- `--difficulty`: accepts the raw `easy` / `medium` / `hard` values as well as
+  the more submission-shaped aliases `longcot-mini` (`easy`) and `longcot`
+  (`medium` + `hard`).
 - `--heartbeat-s`: print per-question progress while a sample is still running.
 - `--verbose`: enable Tolstoy debug logs during the benchmark run.
 - `--timeout-ms`: per-question timeout budget.

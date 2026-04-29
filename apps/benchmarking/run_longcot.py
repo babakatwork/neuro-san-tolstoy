@@ -193,6 +193,20 @@ def _verification_options(disable_fallback: bool) -> VerifyOptions | None:
     return NO_FALLBACK
 
 
+def filter_questions_by_difficulty(questions, difficulty: str | None):
+    if not difficulty:
+        return list(questions)
+
+    normalized = str(difficulty).strip().lower()
+    if normalized == "longcot-mini":
+        allowed = {"easy"}
+    elif normalized == "longcot":
+        allowed = {"medium", "hard"}
+    else:
+        allowed = {normalized}
+    return [question for question in questions if str(question.difficulty).strip().lower() in allowed]
+
+
 def _looks_like_transport_repr(text: str) -> bool:
     stripped = (text or "").strip()
     if not stripped:
@@ -311,7 +325,7 @@ def run_one(question, args, run_id: str) -> dict[str, Any]:
 def main():
     parser = argparse.ArgumentParser(description="Run the Neuro-SAN Tolstoy agent on the LongCoT benchmark.")
     parser.add_argument("--domain", help="Optional LongCoT domain filter.")
-    parser.add_argument("--difficulty", help="Optional LongCoT difficulty filter.")
+    parser.add_argument("--difficulty", help="Optional LongCoT difficulty filter. Accepts easy|medium|hard plus longcot-mini and longcot aliases.")
     parser.add_argument("--n", type=int, help="Run only the first N filtered questions.")
     parser.add_argument("--index", type=int, help="Run one question by 0-based index in the filtered set.")
     parser.add_argument("--question-id", help="Run one question by LongCoT question id.")
@@ -359,8 +373,7 @@ def main():
     questions = load_questions()
     if args.domain:
         questions = [question for question in questions if question.domain == args.domain]
-    if args.difficulty:
-        questions = [question for question in questions if str(question.difficulty) == str(args.difficulty)]
+    questions = filter_questions_by_difficulty(questions, args.difficulty)
     if args.question_id:
         questions = [question for question in questions if str(question.question_id) == str(args.question_id)]
     if args.shortest_first:
