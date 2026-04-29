@@ -1,0 +1,3 @@
+neuro-san==0.6.39
+longcot @ git+https://github.com/LongHorizonReasoning/longcot.git
+pytest

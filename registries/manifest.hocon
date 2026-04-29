@@ -1,0 +1,3 @@
+{
+    include "registries/tolstoy/manifest.hocon",
+}

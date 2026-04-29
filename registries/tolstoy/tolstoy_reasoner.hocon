@@ -1,0 +1,364 @@
+{
+    include "registries/llm_config.hocon",
+
+    "metadata": {
+        "description": "A Neuro-SAN implementation of the Tolstoy DAG-style reasoning system.",
+        "tags": ["tolstoy", "dag", "reasoning", "maker"],
+        "sample_queries": [
+            "What is 46048 x 42098?",
+            """
+{
+  "problem": "What is 46048 x 42098?",
+  "max_iter": 24,
+  "k_answer": 3,
+  "use_scratchpad": true
+}
+"""
+        ]
+    },
+
+    "tools": [
+        {
+            "name": "tolstoy_reasoner",
+            "function": {
+                "description": "Human-facing wrapper for the Tolstoy coded tool.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "problem": {"type": "string", "description": "Problem to solve with Tolstoy."},
+                        "max_iter": {"type": "int"},
+                        "max_active_nodes": {"type": "int"},
+                        "k_answer": {"type": "int"},
+                        "k_validator": {"type": "int"},
+                        "k_gc": {"type": "int"},
+                        "max_proposal_retries": {"type": "int"},
+                        "use_gc": {"type": "boolean"},
+                        "use_reasons": {"type": "boolean"},
+                        "show_nc_answers": {"type": "boolean"},
+                        "use_scratchpad": {"type": "boolean"},
+                        "cite_problem": {"type": "boolean"},
+                        "answer_temperature": {"type": "float"},
+                        "frames_path": {"type": "string"},
+                        "result_path": {"type": "string"}
+                    },
+                    "required": ["problem"]
+                }
+            },
+            "instructions": """
+You are the top-level wrapper for the Tolstoy DAG solver.
+
+Always call the tolstoy_solver tool. Never solve the problem yourself.
+
+Input handling:
+- If the user gives a plain-language problem, treat the whole message as the problem.
+- If the user gives structured JSON or named fields that match the tool parameters,
+  pass those values through to tolstoy_solver unchanged.
+- If the user omits a field, let the tool use its default.
+
+Return exactly the text returned by tolstoy_solver, with no extra commentary.
+""",
+            "tools": ["tolstoy_solver"],
+            "allow": {
+                "to_upstream": {
+                    "sly_data": ["tolstoy_result"]
+                }
+            }
+        },
+        {
+            "name": "tolstoy_solver",
+            "function": {
+                "description": "Runs the Tolstoy DAG engine and returns the final answer string.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "problem": {"type": "string"},
+                        "max_iter": {"type": "int", "default": 50},
+                        "max_active_nodes": {"type": "int", "default": 10},
+                        "k_answer": {"type": "int", "default": 3},
+                        "k_validator": {"type": "int", "default": 3},
+                        "k_gc": {"type": "int", "default": 3},
+                        "max_proposal_retries": {"type": "int", "default": 5},
+                        "use_gc": {"type": "boolean", "default": false},
+                        "use_reasons": {"type": "boolean", "default": false},
+                        "show_nc_answers": {"type": "boolean", "default": false},
+                        "use_scratchpad": {"type": "boolean", "default": false},
+                        "cite_problem": {"type": "boolean", "default": true},
+                        "answer_temperature": {"type": "float", "default": 0.7},
+                        "frames_path": {"type": "string"},
+                        "result_path": {"type": "string"}
+                    },
+                    "required": ["problem"]
+                }
+            },
+            "class": "coded_tools.tolstoy.solver_tool.TolstoySolverTool",
+            "args": {
+                "tools": {
+                    "proposer": "tolstoy_proposer",
+                    "validator": "tolstoy_validator",
+                    "answerer": "tolstoy_answerer",
+                    "equivalence_judge": "tolstoy_equivalence_judge",
+                    "gc": "tolstoy_gc",
+                    "scratchpad": "tolstoy_scratchpad",
+                    "consolidator": "tolstoy_consolidator"
+                }
+            },
+            "allow": {
+                "from_downstream": {
+                    "messages": true
+                }
+            }
+        },
+        {
+            "name": "tolstoy_proposer",
+            "function": {
+                "description": "Proposes the next DAG question to ask.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "problem": {"type": "string"},
+                        "active_facts": {"type": "string"},
+                        "scratchpad": {"type": "string"},
+                        "feedback": {"type": "string"},
+                        "use_reasons": {"type": "boolean"},
+                        "cite_problem": {"type": "boolean"}
+                    },
+                    "required": ["problem", "active_facts"]
+                }
+            },
+            "llm_config": {
+                "temperature": 0.0
+            },
+            "instructions": """
+You are the proposer for a DAG-based reasoning system.
+
+Your job is orchestration, not calculation. Never solve the root problem or
+compute intermediate values yourself. Instead, propose one next question whose
+answer can become a verified DAG fact.
+
+Key rules:
+- Answerers will see only the proposed question text. They do not see the
+  original problem, parent facts, or scratchpad.
+- Every question must therefore be self-contained: copy any needed facts
+  directly into the question and attribute them to the original problem or to a
+  numbered parent fact.
+- Every factual claim in the question must have an explicit source.
+- The requested answer format must be precise enough that two correct answerers
+  should produce the same final string.
+- Answerers serialize their result through a `FINAL ANSWER:` wrapper. Do not
+  ask for bare outputs such as "digits only", "no extra text", or "answer with
+  only the integer". Instead, describe the content that should appear after the
+  wrapper.
+- Prefer rich, specific answers over yes/no questions.
+- You may cite only ANSWERED facts.
+- If the current graph already contains an answered node that solves the root
+  problem, stop and point to it instead of asking another question.
+
+If feedback is present, fix that specific problem before proposing again.
+
+Output exactly one of these formats:
+
+FINAL ANSWER NODE: <node id>
+
+or
+
+PARENT FACTS: <comma-separated ids>
+PROPOSED QUESTION: <self-contained question>
+RETIRE: <comma-separated ids or NONE>
+REASON: <one short sentence>
+""",
+        },
+        {
+            "name": "tolstoy_validator",
+            "function": {
+                "description": "Checks whether a proposed DAG question is structurally valid.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "problem": {"type": "string"},
+                        "source_facts": {"type": "string"},
+                        "question": {"type": "string"}
+                    },
+                    "required": ["problem", "source_facts", "question"]
+                }
+            },
+            "llm_config": {
+                "temperature": 0.6
+            },
+            "instructions": """
+You validate a proposed DAG question.
+
+You are given:
+- the original problem
+- the cited source facts
+- the proposed question
+
+Check three conditions:
+1. SELF-CONTAINED: the question includes every fact needed to answer it.
+2. CITED: every factual claim in the question is explicitly attributed, and any
+   quoted or copied content matches the cited source.
+3. UNAMBIGUOUS: the question asks for exactly one well-specified answer format.
+
+Do not judge strategic usefulness. Only judge structural validity.
+
+Output exactly:
+ITEM 1: PASS or FAIL - <brief reason>
+ITEM 2: PASS or FAIL - <brief reason>
+ITEM 3: PASS or FAIL - <brief reason>
+VERDICT: ACCEPT or REJECT
+""",
+        },
+        {
+            "name": "tolstoy_answerer",
+            "function": {
+                "description": "Answers a self-contained Tolstoy sub-question.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "question": {"type": "string"},
+                        "answer_temperature": {"type": "float"}
+                    },
+                    "required": ["question"]
+                }
+            },
+            "llm_config": {
+                "temperature": 0.7
+            },
+            "instructions": """
+You answer self-contained sub-questions.
+
+Use only the question text. Do not assume hidden context.
+
+If the question contains inconsistent premises, a false quoted statement, or an
+internal contradiction that prevents a trustworthy answer, output:
+CONTRADICTION: <brief explanation>
+
+Otherwise solve the question and finish with:
+FINAL ANSWER: <answer body>
+
+Important:
+- Treat `FINAL ANSWER:` as a transport wrapper required by the system, not as a
+  contradiction with the question's requested answer content.
+- The `<answer body>` after the wrapper must follow the question's requested
+  content/format exactly.
+- If the requested answer naturally spans multiple lines, put the first line
+  after `FINAL ANSWER:` and continue the remaining lines below it.
+""",
+        },
+        {
+            "name": "tolstoy_equivalence_judge",
+            "function": {
+                "description": "Determines whether multiple candidate answers are equivalent.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "question": {"type": "string"},
+                        "answers": {
+                            "type": "array",
+                            "items": {"type": "string"}
+                        }
+                    },
+                    "required": ["question", "answers"]
+                }
+            },
+            "llm_config": {
+                "temperature": 0.0
+            },
+            "instructions": """
+You judge whether multiple candidate answers mean the same thing for the given
+question and respect the same required answer format.
+
+Output exactly:
+VERDICT: SAME or DIFFERENT
+CANONICAL: <best canonical answer if SAME>
+""",
+        },
+        {
+            "name": "tolstoy_consolidator",
+            "function": {
+                "description": "Selects a set of facts that should be merged into a denser summary fact.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "problem": {"type": "string"},
+                        "active_facts": {"type": "string"}
+                    },
+                    "required": ["problem", "active_facts"]
+                }
+            },
+            "llm_config": {
+                "temperature": 0.0
+            },
+            "instructions": """
+You help a DAG reasoner keep its active fact set compact.
+
+Pick two or more answered facts whose content can be merged into one new,
+self-contained fact that will be easier for later questions to cite.
+
+The merge question must quote the needed fact content directly, remain
+self-contained, and request a concrete output format.
+
+Output exactly:
+CONSOLIDATE: <comma-separated fact ids>
+MERGE QUESTION: <self-contained merge question>
+""",
+        },
+        {
+            "name": "tolstoy_gc",
+            "function": {
+                "description": "Suggests which active answered facts can be retired after a new fact is added.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "problem": {"type": "string"},
+                        "active_facts": {"type": "string"},
+                        "new_fact": {"type": "string"}
+                    },
+                    "required": ["problem", "active_facts", "new_fact"]
+                }
+            },
+            "llm_config": {
+                "temperature": 0.2
+            },
+            "instructions": """
+You are a conservative garbage collector for DAG facts.
+
+Retire a fact only when the newly confirmed fact clearly absorbs it or makes it
+irrelevant for future work. When unsure, keep the fact.
+
+Output exactly:
+RETIRE: <comma-separated ids or NONE>
+REASON <id>: <brief explanation for each retired id>
+""",
+        },
+        {
+            "name": "tolstoy_scratchpad",
+            "function": {
+                "description": "Updates a short capability scratchpad after failures.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "problem": {"type": "string"},
+                        "scratchpad": {"type": "string"},
+                        "event_type": {"type": "string"},
+                        "question": {"type": "string"},
+                        "result": {"type": "string"}
+                    },
+                    "required": ["problem", "scratchpad", "event_type", "question", "result"]
+                }
+            },
+            "llm_config": {
+                "temperature": 0.0
+            },
+            "instructions": """
+You maintain a short working scratchpad for the Tolstoy proposer.
+
+Summarize what the latest failure teaches the system:
+- recurring validator mistakes
+- question sizes that led to no-consensus
+- premises that turned out to be unsafe
+
+Return only the revised scratchpad as concise bullet points.
+""",
+        }
+    ]
+}
